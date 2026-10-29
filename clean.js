@@ -260,8 +260,8 @@ if (!adb_bin) die("找不到 adb。安装方法见 docs/01-准备工作.md");
 await u2Ensure();
 
 const [dev_li, bad_li] = await deviceList(adb_bin);
-for (const [s, t] of bad_li)
-  console.log("· " + s + "：" + (t === "unauthorized" ? "未授权，请在手机弹窗勾选「始终允许」并点「允许」" : t + "，重插数据线或重开 USB 调试"));
+for (const [serial, state] of bad_li)
+  console.log("· " + serial + "：" + (state === "unauthorized" ? "未授权，请在手机弹窗勾选「始终允许」并点「允许」" : state + "，重插数据线或重开 USB 调试"));
 if (!dev_li.length) die("没有可用的手机。检查数据线和 USB 调试，见 docs/01-准备工作.md");
 let work_li = dev_li;
 if (only_serial) {
