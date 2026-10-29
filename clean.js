@@ -8,14 +8,15 @@
 //                            （只关脚本里点名的开关；不加则跳过机型脚本，只跑通用部分）
 //
 // 每台手机依次执行：备份快照 → 机型脚本 → 关营销通知渠道（自动滤掉服务类）
-//   → 挂起广告包 → 关闭快应用 → finish 收尾。跑这个脚本即视为机主同意这些改动，
-//   全部可还原（见结尾汇总）。中途 Ctrl-C 会先给当前手机跑 finish 再退出。
+//   → 挂起广告包 → 关闭快应用 → 补全 Play 商店、已装 Chrome 就设为默认 → finish 收尾。
+// 跑这个脚本即视为机主同意这些改动，全部可还原（见结尾汇总）。中途 Ctrl-C 会先给当前手机跑 finish 再退出。
 import { $ } from "bun";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, statSync } from "node:fs";
 
 process.chdir(import.meta.dirname);
 const ROOT = import.meta.dirname;
 const BK_ROOT = process.env.AAC_BACKUPS || ROOT + "/backups";
+const CHROME_PKG = "com.android.chrome", VENDING_PKG = "com.android.vending", APK_HOME = "/tmp/android", DL_TMP = "/tmp/chrome-dl";
 let py = process.env.AAC_PYTHON || "python3";
 
 let ref_mode = false, only_serial = "", cur_serial = "";
@@ -112,10 +113,94 @@ const channelOff = async (serial, tsv) => {
   return [rc, out_text];
 };
 
+// ---------- Play 商店 + 默认浏览器（Chrome） ----------
+// 真·Play 商店直链可断点续传；下载到 /tmp 校验 MD5 后再移入 /tmp/android，避免半截文件。
+// 系统预置的 com.android.vending 是无界面更新桩，同签名覆盖安装即得完整商店。
+const fileMd5 = async (p) => {
+  const hasher = new Bun.CryptoHasher("md5");
+  for await (const chunk of Bun.file(p).stream()) hasher.update(chunk);
+  return hasher.digest("hex");
+};
+
+const storeApkEnsure = async () => {
+  const exist_li = existsSync(APK_HOME)
+    ? readdirSync(APK_HOME).filter(f => f.startsWith(VENDING_PKG) && f.endsWith(".apk")) : [];
+  if (exist_li.length) return { path: APK_HOME + "/" + exist_li.sort().at(-1), fresh: false };
+  const meta_raw = await $`curl -sL --max-time 30 "https://ws75.aptoide.com/api/7/apps/search?query=google+play+store&limit=8"`.quiet().nothrow();
+  let hit = null;
+  if (meta_raw.exitCode === 0) {
+    try { hit = JSON.parse(meta_raw.stdout.toString()).datalist.list.find(n => n.package === VENDING_PKG && n.file); } catch { }
+  }
+  if (!hit) return null;
+  const part = DL_TMP + "/play.apk.part";
+  if (existsSync(part) && Date.now() - statSync(part).mtimeMs < 10 * 60 * 1000) {
+    console.log("另一处正在下载 Play 商店（" + part + " 10 分钟内有更新），本轮跳过下载");
+    return null;
+  }
+  mkdirSync(DL_TMP, { recursive: true });
+  for (let i = 0; i < 40; ++i) {
+    await $`curl -sL -C - --max-time 280 --connect-timeout 15 -o ${part} ${hit.file.path}`.nothrow();
+    if ((await fileMd5(part)) === hit.file.md5sum) {
+      mkdirSync(APK_HOME, { recursive: true });
+      const dest = APK_HOME + "/" + VENDING_PKG + "-" + hit.file.vername.replaceAll(" ", "_") + ".apk";
+      renameSync(part, dest);
+      return { path: dest, fresh: true };
+    }
+    console.log("第 " + (i + 1) + " 次下载没下完整，断点续传……");
+  }
+  return null;
+};
+
+const storeLauncherOk = async (serial) => {
+  const out = (await $`${adb_bin} -s ${serial} shell cmd package resolve-activity --brief -c android.intent.category.LAUNCHER ${VENDING_PKG}`.quiet().nothrow()).stdout.toString();
+  return out.includes("/") && !out.includes("No activity");
+};
+
+const storeReady = async (serial, apk_path) => {
+  if (await storeLauncherOk(serial)) return "";
+  console.log("补装 Play 商店（同签名覆盖预置的更新桩）……");
+  const ins = await $`${adb_bin} -s ${serial} install -r -d ${apk_path}`.nothrow();
+  if (ins.exitCode !== 0)
+    return "安装失败：" + (ins.stderr.toString() + ins.stdout.toString()).split("\n").filter(Boolean).pop().slice(0, 120);
+  return (await storeLauncherOk(serial)) ? "" : "商店已装上，入口没立刻认出；重启手机后重跑";
+};
+
+const browserSet = async (serial) => {
+  if ((await $`${adb_bin} -s ${serial} shell pm path ${CHROME_PKG}`.quiet().nothrow()).exitCode !== 0)
+    return "未装 Chrome（Play 商店就绪后搜 Chrome 安装，再跑一轮自动设置）";
+  const holdersRaw = async () =>
+    (await $`${adb_bin} -s ${serial} shell cmd role get-role-holders android.app.role.BROWSER`.quiet().nothrow())
+      .stdout.toString().split("\n").map(s => s.trim()).filter(Boolean);
+  await $`${adb_bin} -s ${serial} shell cmd role add-role-holder android.app.role.BROWSER ${CHROME_PKG}`.nothrow();
+  for (const holder of await holdersRaw())
+    if (holder !== CHROME_PKG)
+      await $`${adb_bin} -s ${serial} shell cmd role remove-role-holder android.app.role.BROWSER ${holder}`.nothrow();
+  const now_li = await holdersRaw();
+  return now_li.length === 1 && now_li[0] === CHROME_PKG ? "" : "角色设置未确认（现在：" + now_li.join(",") + "）";
+};
+
+// ---------- 系统清理（全部可逆：只清缓存 / 日志 / 后台进程，不碰应用数据） ----------
+const dfAvail = async (serial) => {
+  const r = await $`${adb_bin} -s ${serial} shell df -k /data`.quiet().nothrow();
+  for (const line of r.stdout.toString().split("\n")) {
+    const col_li = line.trim().split(/\s+/);
+    if (col_li.length >= 4 && col_li[0].startsWith("/dev")) return parseInt(col_li[3], 10);
+  }
+  return 0;
+};
+
+const sysClean = async (serial) => {
+  const before = await dfAvail(serial);
+  await $`${adb_bin} -s ${serial} shell pm trim-caches 999G`.nothrow();   // 裁掉全部应用缓存（会自动重建）
+  await $`${adb_bin} -s ${serial} shell logcat -b all -c`.nothrow();      // 清日志缓冲
+  await $`${adb_bin} -s ${serial} shell am kill-all`.nothrow();           // 回收后台进程
+  return Math.max(0, Math.round((await dfAvail(serial) - before) / 1024));
+};
+
 // ---------- 单台清理 ----------
 const cleanOne = async (serial) => {
   cur_serial = "";
-  let closed_cnt = 0;
+  let closed_cnt = 0, browser_ok = false;
   console.log("\n━━━━━━━━━ 开始处理 " + serial + " ━━━━━━━━━");
 
   const st = await statusLoad(serial);
@@ -219,11 +304,37 @@ const cleanOne = async (serial) => {
     console.log("广告包和快应用：没有需要处理的（已挂起 / 未安装 / 已关闭）");
   }
 
+  // Play 商店 + 默认浏览器（pm/role 操作不依赖读屏）
+  if (play_apk) {
+    const store_why = await storeReady(serial, play_apk.path);
+    if (store_why) {
+      console.log("⚠ Play 商店没补装成功：" + store_why);
+      note_li.push(serial + "：Play 商店没补装——" + store_why);
+    } else {
+      console.log("Play 商店就绪");
+    }
+  } else {
+    note_li.push(serial + "：Play 商店安装包没就绪，跳过补装");
+  }
+  const browser_why = await browserSet(serial);
+  browser_ok = !browser_why;
+  if (browser_why) {
+    console.log("默认浏览器未设成 Chrome：" + browser_why);
+    note_li.push(serial + "：默认浏览器未设成 Chrome——" + browser_why);
+  } else {
+    console.log("默认浏览器已设为 Chrome");
+  }
+
+  // 系统清理（缓存 / 日志 / 后台进程，不碰应用数据）
+  const freed_mb = await sysClean(serial);
+  console.log("系统清理：释放约 " + freed_mb + " MB（应用缓存 + 日志缓冲 + 后台进程）");
+
   if ((await stepRun(serial, "finish")).exitCode !== 0)
     note_li.push(serial + "：收尾失败，请手动核对插电常亮");
   cur_serial = "";
   const chan_txt = st.input_blocked ? "渠道跳过（读屏被拒）" : "渠道拨了 " + closed_cnt + " 个";
-  result_li.push(serial + " ✓ 完成（" + chan_txt + "，广告包 " + ad_li.length + " 个，快应用 " + qa_li.length + " 个）");
+  result_li.push(serial + " ✓ 完成（" + chan_txt + "，广告包 " + ad_li.length + " 个，快应用 " + qa_li.length
+    + " 个，浏览器" + (browser_ok ? "已设 Chrome" : "未改") + "，清理 " + freed_mb + "MB）");
 };
 
 // ---------- 中断收尾：备份成功后中断，先给当前手机跑 finish 再退出 ----------
@@ -248,7 +359,7 @@ for (let i = 0; i < arg_li.length; ++i) {
     only_serial = arg_li[++i] || "";
     if (!only_serial) die("-s 后面要跟序列号");
   } else if (arg_li[i] === "-h" || arg_li[i] === "--help") {
-    const head = (await Bun.file(import.meta.path).text()).split("\n").slice(1, 12);
+    const head = (await Bun.file(import.meta.path).text()).split("\n").slice(1, 13);
     console.log(head.map(l => l.replace(/^\/\/ ?/, "")).join("\n"));
     process.exit(0);
   } else die("未知参数：" + arg_li[i] + "（-h 看用法）");
@@ -270,6 +381,9 @@ if (only_serial) {
 }
 
 await $`${py} tool/run.py devices`.nothrow();   // 给人看的总表：型号、系统版本、有没有现成机型脚本
+const play_apk = await storeApkEnsure();
+console.log(play_apk ? (play_apk.fresh ? "已下载" : "复用已有的") + " Play 商店安装包：" + play_apk.path
+  : "⚠ Play 商店安装包没就绪（网络原因或别处正在下载），跳过补装");
 for (const s of work_li) await cleanOne(s);
 
 // ---------- 汇总 ----------
